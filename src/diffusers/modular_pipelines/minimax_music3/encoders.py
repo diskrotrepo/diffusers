@@ -311,6 +311,16 @@ class MiniMaxMusic3SemanticGenerationStep(ModularPipelineBlocks):
                 type_hint=float,
                 description="Sampling temperature of the autoregressive stage; higher is more random.",
             ),
+            InputParam(
+                "min_new_seconds",
+                default=0.0,
+                type_hint=float,
+                description=(
+                    "Minimum seconds of newly generated audio before the model is allowed to end the song: the "
+                    "audio-end token is masked until this much new audio exists. Use when continuing a song that "
+                    "would otherwise wrap up immediately (e.g. right after a chorus). Capped at `audio_duration`."
+                ),
+            ),
             InputParam.template("generator"),
         ]
 
@@ -347,6 +357,8 @@ class MiniMaxMusic3SemanticGenerationStep(ModularPipelineBlocks):
             raise ValueError(f"`top_k` must be at least 1, got {block_state.top_k}")
         if block_state.temperature <= 0:
             raise ValueError(f"`temperature` must be positive, got {block_state.temperature}")
+        if block_state.min_new_seconds < 0:
+            raise ValueError(f"`min_new_seconds` must be non-negative, got {block_state.min_new_seconds}")
 
     @torch.no_grad()
     def __call__(self, components: MiniMaxMusic3ModularPipeline, state: PipelineState) -> PipelineState:
@@ -386,6 +398,7 @@ class MiniMaxMusic3SemanticGenerationStep(ModularPipelineBlocks):
         cfg_scale = float(block_state.cfg_scale)
         top_k = int(block_state.top_k)
         temperature = float(block_state.temperature)
+        min_new_frames = min(int(round(block_state.min_new_seconds * components.frame_rate)), max_frames)
 
         language_model = components.language_model
         # Trigger CPU-offload hooks by hand (same workaround as minimax_h3): the autoregressive loop calls
@@ -447,6 +460,9 @@ class MiniMaxMusic3SemanticGenerationStep(ModularPipelineBlocks):
             threshold = torch.topk(conditional, min(top_k, conditional.shape[-1]), dim=-1).values[..., -1, None]
             guided = guided.masked_fill(conditional < threshold, -float("inf"))
             guided = guided.masked_fill(vocab_mask.unsqueeze(0), -float("inf"))
+            if len(frame_hiddens) < min_new_frames:
+                # The song is not allowed to end yet: mask the end token so the model must keep performing.
+                guided[..., _AUDIO_END_TOKEN_ID] = -float("inf")
             sampled = _sample_top_k(guided, generator, top_k, temperature)
             if int(sampled.item()) == _AUDIO_END_TOKEN_ID:
                 break
