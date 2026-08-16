@@ -28,6 +28,7 @@ from ..modular_pipeline import (
     PipelineState,
 )
 from ..modular_pipeline_utils import ComponentSpec, InputParam, OutputParam
+from .acceleration import compile_blocks, quantize_to_fp8
 from .before_denoise import _CHUNK_FRAMES
 from .modular_pipeline import MiniMaxMusic3ModularPipeline
 
@@ -319,6 +320,13 @@ class MiniMaxMusic3ChunkLoopWrapper(LoopSequentialPipelineBlocks):
         block_state.latent_chunks = []
         block_state.previous_latent = None
         block_state.previous_condition = None
+
+        # fp8 weights and a compiled block, prepared once per process; both calls are no-ops after the first
+        # generation. Only the stacked blocks are quantized. The timestep embedding is deliberately left in
+        # bf16: it conditions every position of every window, so its error would not average out the way a
+        # per-block weight's does, and it is far too small to be worth any bandwidth.
+        quantize_to_fp8(components.transformer.transformer_blocks)
+        compile_blocks(components.transformer)
 
         num_chunks = len(block_state.chunk_starts)
         with self.progress_bar(total=num_chunks * block_state.num_inference_steps) as progress_bar:

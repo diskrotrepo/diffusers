@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import re
-import weakref
 from typing import Optional
 
 import torch
@@ -25,6 +24,7 @@ from ...models import MiniMaxMusic3RVQDepthDecoder
 from ...utils import logging
 from ..modular_pipeline import ModularPipelineBlocks, PipelineState
 from ..modular_pipeline_utils import ComponentSpec, InputParam, OutputParam
+from .acceleration import compiled
 from .modular_pipeline import MiniMaxMusic3ModularPipeline
 
 
@@ -71,25 +71,6 @@ _CACHE_LENGTH_BUCKET = 1_024
 # this many frames are generated past the end token and then discarded: a fraction of a second, and the discarded
 # frames never reach the audio.
 _EOS_CHECK_INTERVAL = 8
-
-# Compiled wrappers live here rather than on the modules themselves: assigning one to an `nn.Module` attribute would
-# register it as a child module, leaving the model holding a wrapper around itself.
-_COMPILED_MODULES = weakref.WeakKeyDictionary()
-
-
-def _compiled(model: torch.nn.Module, **compile_kwargs) -> torch.nn.Module:
-    """A `torch.compile`d view of `model`, built once per process and reused across pipeline calls.
-
-    The frame loop is launch-bound rather than compute-bound: an eager decode step of the 8B language model runs at
-    roughly a fifth of the memory-bandwidth roofline, and the depth decoder is invoked seven more times per frame.
-    Compiling both — with the language model on a fixed-shape `StaticCache` so its graph is traced once — roughly
-    halves the cost of a frame. Set `TORCHDYNAMO_DISABLE=1` to run everything eagerly.
-    """
-    compiled = _COMPILED_MODULES.get(model)
-    if compiled is None:
-        compiled = torch.compile(model, **compile_kwargs)
-        _COMPILED_MODULES[model] = compiled
-    return compiled
 
 
 def _clean_caption(caption: str) -> str:
@@ -472,7 +453,7 @@ class MiniMaxMusic3SemanticGenerationStep(ModularPipelineBlocks):
                 dtype=language_model.dtype,
             )
         depth_decoder = (
-            components.rvq_depth_decoder if hooked else _compiled(components.rvq_depth_decoder, dynamic=True)
+            components.rvq_depth_decoder if hooked else compiled(components.rvq_depth_decoder, dynamic=True)
         )
 
         text_embeds = language_model.model.embed_tokens(text_ids)
@@ -520,7 +501,7 @@ class MiniMaxMusic3SemanticGenerationStep(ModularPipelineBlocks):
         sampling_mask[_AUDIO_CODE_SLICE_OFFSET : _AUDIO_CODE_SLICE_OFFSET + _SEMANTIC_VOCAB_SIZE] = False
         sampling_mask[_AUDIO_END_SLICE_INDEX] = False
 
-        decode_model = language_model.model if hooked else _compiled(language_model.model, dynamic=False)
+        decode_model = language_model.model if hooked else compiled(language_model.model, dynamic=False)
         decode_position = torch.tensor([next_position], device=text_ids.device)
 
         frame_hiddens = []
