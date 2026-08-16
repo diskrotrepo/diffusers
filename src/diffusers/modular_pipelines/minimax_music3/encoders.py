@@ -13,11 +13,12 @@
 # limitations under the License.
 
 import re
+import weakref
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from transformers import Qwen2Tokenizer, Qwen3ForCausalLM
+from transformers import Qwen2Tokenizer, Qwen3ForCausalLM, StaticCache
 
 from ...hooks.group_offloading import _is_group_offload_enabled
 from ...models import MiniMaxMusic3RVQDepthDecoder
@@ -53,6 +54,42 @@ _AR_TEMPERATURE = 1.0
 
 _SPECIAL_TAG_RE = re.compile(r"<\|([^|]*)\|>")
 _LEADING_TAGS_RE = re.compile(r"^[ \t]*((?:\[[^\]]+\][ \t]*)+)")
+
+# Only the audio codes and the end token are ever sampled, so the frame loop multiplies the hidden state by just that
+# slice of the output embedding rather than the full 200k-row matrix — the same logits, an order of magnitude less
+# memory traffic per frame, and correspondingly smaller top-k/softmax kernels.
+_AUDIO_SLICE_START = _AUDIO_END_TOKEN_ID
+_AUDIO_SLICE_END = _AUDIO_CODE_OFFSET + _SEMANTIC_VOCAB_SIZE
+_AUDIO_END_SLICE_INDEX = _AUDIO_END_TOKEN_ID - _AUDIO_SLICE_START
+_AUDIO_CODE_SLICE_OFFSET = _AUDIO_CODE_OFFSET - _AUDIO_SLICE_START
+
+# Static cache lengths are rounded up to a multiple of this, so runs of similar duration reuse one compiled graph
+# instead of retracing for every distinct song length.
+_CACHE_LENGTH_BUCKET = 1_024
+# Frames sampled between end-of-song checks. Reading the sampled token back costs a device sync that drains the
+# pipeline every frame and stops the CPU from queueing the next frame's kernels. Batching those checks means at most
+# this many frames are generated past the end token and then discarded: a fraction of a second, and the discarded
+# frames never reach the audio.
+_EOS_CHECK_INTERVAL = 8
+
+# Compiled wrappers live here rather than on the modules themselves: assigning one to an `nn.Module` attribute would
+# register it as a child module, leaving the model holding a wrapper around itself.
+_COMPILED_MODULES = weakref.WeakKeyDictionary()
+
+
+def _compiled(model: torch.nn.Module, **compile_kwargs) -> torch.nn.Module:
+    """A `torch.compile`d view of `model`, built once per process and reused across pipeline calls.
+
+    The frame loop is launch-bound rather than compute-bound: an eager decode step of the 8B language model runs at
+    roughly a fifth of the memory-bandwidth roofline, and the depth decoder is invoked seven more times per frame.
+    Compiling both — with the language model on a fixed-shape `StaticCache` so its graph is traced once — roughly
+    halves the cost of a frame. Set `TORCHDYNAMO_DISABLE=1` to run everything eagerly.
+    """
+    compiled = _COMPILED_MODULES.get(model)
+    if compiled is None:
+        compiled = torch.compile(model, **compile_kwargs)
+        _COMPILED_MODULES[model] = compiled
+    return compiled
 
 
 def _clean_caption(caption: str) -> str:
@@ -126,6 +163,7 @@ def _embed_audio_frame(components: MiniMaxMusic3ModularPipeline, frame_codes: to
 
 def _generate_depth_codes(
     components: MiniMaxMusic3ModularPipeline,
+    depth_decoder: torch.nn.Module,
     last_hidden: torch.Tensor,
     semantic_code: torch.Tensor,
     generator: Optional[torch.Generator],
@@ -133,14 +171,15 @@ def _generate_depth_codes(
     top_k: int = _AR_TOP_K,
     temperature: float = _AR_TEMPERATURE,
 ):
-    # Autoregressively sample the residual codes c1..c7 for one frame and collect their hidden states.
+    # Autoregressively sample the residual codes c1..c7 for one frame and collect their hidden states. `depth_decoder`
+    # is the compiled view of `components.rvq_depth_decoder`; the submodules below are called directly either way.
     sequence = [components.rvq_depth_decoder.projection(last_hidden).unsqueeze(1)]
     code_embed = components.language_model.model.embed_tokens(semantic_code + _AUDIO_CODE_OFFSET)
     sequence.append(components.rvq_depth_decoder.projection(code_embed).unsqueeze(1))
     codes = [semantic_code]
     hidden_parts = []
     for index in range(1, components.num_codebooks):
-        hidden = components.rvq_depth_decoder(torch.cat(sequence, dim=1))[:, -1]
+        hidden = depth_decoder(torch.cat(sequence, dim=1))[:, -1]
         hidden_parts.append(hidden[:1])
         logits = components.rvq_depth_decoder.audio_heads[index - 1](hidden)
         conditional, unconditional = logits[:1].float(), logits[1:2].float()
@@ -418,10 +457,33 @@ class MiniMaxMusic3SemanticGenerationStep(ModularPipelineBlocks):
                 "The language model and the RVQ depth decoder must fit on the device together for autoregressive "
                 "generation; there is not enough free device memory under CPU offloading."
             )
+        # The frame loop only ever runs single-token steps, so a preallocated cache keeps its shape fixed and lets the
+        # step be compiled once and replayed for every frame. Offloaded models keep the growing dynamic cache: their
+        # weights move between devices, which would invalidate the compiled graph's guards on every frame anyway.
+        # Prefill and prefix replay stay eager — their lengths vary, so compiling them would retrace per call.
+        static_cache = None
+        if not hooked:
+            cache_length = text_ids.shape[1] + prefix_frames + max_frames + 1
+            static_cache = StaticCache(
+                config=language_model.config,
+                max_batch_size=text_ids.shape[0],
+                max_cache_len=-(-cache_length // _CACHE_LENGTH_BUCKET) * _CACHE_LENGTH_BUCKET,
+                device=components._execution_device,
+                dtype=language_model.dtype,
+            )
+        depth_decoder = (
+            components.rvq_depth_decoder if hooked else _compiled(components.rvq_depth_decoder, dynamic=True)
+        )
+
         text_embeds = language_model.model.embed_tokens(text_ids)
-        output = language_model.model(inputs_embeds=text_embeds, use_cache=True)
+        # A static cache does not track how much of itself is written, so every call states where its tokens land.
+        cache_position = torch.arange(text_ids.shape[1], device=text_ids.device) if static_cache is not None else None
+        output = language_model.model(
+            inputs_embeds=text_embeds, past_key_values=static_cache, use_cache=True, cache_position=cache_position
+        )
         past_key_values = output.past_key_values
         last_hidden = output.last_hidden_state[:, -1]
+        next_position = text_ids.shape[1]
 
         # `fed_codes` records every frame handed back to the language model (prefix first, then new frames); it is
         # returned as `frame_codes` so a later run can replay it as `prefix_frame_codes` and extend further.
@@ -438,48 +500,95 @@ class MiniMaxMusic3SemanticGenerationStep(ModularPipelineBlocks):
                 chunk[:, :, 1:].permute(1, 0, 2) + offsets
             ).sum(dim=2)
             feedback = (semantic_embeds + residual_embeds.to(semantic_embeds.dtype)) * components.num_codebooks**-0.5
-            output = language_model.model(inputs_embeds=feedback, past_key_values=past_key_values, use_cache=True)
+            cache_position = (
+                torch.arange(next_position, next_position + feedback.shape[1], device=chunk.device)
+                if static_cache is not None
+                else None
+            )
+            output = language_model.model(
+                inputs_embeds=feedback,
+                past_key_values=past_key_values,
+                use_cache=True,
+                cache_position=cache_position,
+            )
             past_key_values = output.past_key_values
             last_hidden = output.last_hidden_state[:, -1]
+            next_position += feedback.shape[1]
 
-        vocab_mask = torch.ones(language_model.config.vocab_size, dtype=torch.bool, device=text_ids.device)
-        vocab_mask[_AUDIO_CODE_OFFSET : _AUDIO_CODE_OFFSET + _SEMANTIC_VOCAB_SIZE] = False
-        vocab_mask[_AUDIO_END_TOKEN_ID] = False
+        # Indexed by the sliced output embedding below, so the mask covers the slice rather than the whole vocabulary.
+        sampling_mask = torch.ones(_AUDIO_SLICE_END - _AUDIO_SLICE_START, dtype=torch.bool, device=text_ids.device)
+        sampling_mask[_AUDIO_CODE_SLICE_OFFSET : _AUDIO_CODE_SLICE_OFFSET + _SEMANTIC_VOCAB_SIZE] = False
+        sampling_mask[_AUDIO_END_SLICE_INDEX] = False
+
+        decode_model = language_model.model if hooked else _compiled(language_model.model, dynamic=False)
+        decode_position = torch.tensor([next_position], device=text_ids.device)
 
         frame_hiddens = []
+        # Each entry records a sampled token together with the lengths the two output lists had before that frame
+        # appended to them, so a frame that turns out to be the end of the song can be rolled back once its token is
+        # finally read (see `_EOS_CHECK_INTERVAL`).
+        pending_frames = []
+        reached_max_frames = False
         # The very first frame of the whole sequence only advances the state past `<|audio_start|>` and is not an
         # emitted frame. A replayed prefix already played that role, so when continuing (`fed_codes` non-empty) every
         # new frame is emitted.
         for _ in range(max_frames + 1):
-            logits = language_model.lm_head(last_hidden).float()
-            logits = logits.masked_fill(vocab_mask, -float("inf"))
+            logits = F.linear(last_hidden, language_model.lm_head.weight[_AUDIO_SLICE_START:_AUDIO_SLICE_END]).float()
+            logits = logits.masked_fill(sampling_mask, -float("inf"))
             conditional, unconditional = logits[0:1], logits[1:2]
             guided = unconditional + (conditional - unconditional) * cfg_scale
             # Restrict the guided distribution to the conditional branch's top candidates, then re-mask: guidance on
             # two `-inf` logits produces NaN on masked positions.
             threshold = torch.topk(conditional, min(top_k, conditional.shape[-1]), dim=-1).values[..., -1, None]
             guided = guided.masked_fill(conditional < threshold, -float("inf"))
-            guided = guided.masked_fill(vocab_mask.unsqueeze(0), -float("inf"))
+            guided = guided.masked_fill(sampling_mask.unsqueeze(0), -float("inf"))
             if len(frame_hiddens) < min_new_frames:
                 # The song is not allowed to end yet: mask the end token so the model must keep performing.
-                guided[..., _AUDIO_END_TOKEN_ID] = -float("inf")
+                guided[..., _AUDIO_END_SLICE_INDEX] = -float("inf")
             sampled = _sample_top_k(guided, generator, top_k, temperature)
-            if int(sampled.item()) == _AUDIO_END_TOKEN_ID:
-                break
+            pending_frames.append((sampled, len(frame_hiddens), len(fed_codes)))
 
-            semantic_code = sampled - _AUDIO_CODE_OFFSET
+            semantic_code = sampled - _AUDIO_CODE_SLICE_OFFSET
             frame_codes, depth_hidden = _generate_depth_codes(
-                components, last_hidden, semantic_code.repeat(2), generator, cfg_scale, top_k, temperature
+                components,
+                depth_decoder,
+                last_hidden,
+                semantic_code.repeat(2),
+                generator,
+                cfg_scale,
+                top_k,
+                temperature,
             )
             if fed_codes:
                 frame_hiddens.append(torch.cat((last_hidden[:1], depth_hidden), dim=-1))
-                if len(frame_hiddens) >= max_frames:
+                reached_max_frames = len(frame_hiddens) >= max_frames
+            if not reached_max_frames:
+                feedback = _embed_audio_frame(components, frame_codes)
+                fed_codes.append(frame_codes)
+
+            if reached_max_frames or len(pending_frames) >= _EOS_CHECK_INTERVAL:
+                # Read the deferred tokens. The first end token wins: every list entry appended by that frame and the
+                # frames speculatively generated after it is dropped, leaving exactly what an immediate check would.
+                ended = False
+                for token, hidden_mark, fed_mark in pending_frames:
+                    if int(token.item()) == _AUDIO_END_SLICE_INDEX:
+                        del frame_hiddens[hidden_mark:]
+                        del fed_codes[fed_mark:]
+                        ended = True
+                        break
+                pending_frames.clear()
+                if ended or reached_max_frames:
                     break
-            feedback = _embed_audio_frame(components, frame_codes)
-            fed_codes.append(frame_codes)
-            output = language_model.model(inputs_embeds=feedback, past_key_values=past_key_values, use_cache=True)
+
+            output = decode_model(
+                inputs_embeds=feedback,
+                past_key_values=past_key_values,
+                use_cache=True,
+                cache_position=decode_position if static_cache is not None else None,
+            )
             past_key_values = output.past_key_values
             last_hidden = output.last_hidden_state[:, -1]
+            decode_position.add_(1)
 
         if not frame_hiddens:
             reason = (

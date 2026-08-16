@@ -216,16 +216,37 @@ class MiniMaxMusic3ChunkDenoiseInner(ModularPipelineBlocks):
             components.guider.set_state(step=i, num_inference_steps=block_state.num_inference_steps, timestep=t)
             guider_state = components.guider.prepare_inputs(guider_inputs)
 
-            for guider_state_batch in guider_state:
+            # Plain classifier-free guidance branches differ only in their conditioning, so one batched pass produces
+            # both predictions. Guiders that reconfigure the denoiser between branches (skip-layer,
+            # perturbed-attention, auto-guidance) get one pass each, or every branch would run under whichever
+            # configuration was installed last.
+            if type(components.guider) is ClassifierFreeGuidance and len(guider_state) > 1:
                 components.guider.prepare_models(components.transformer)
-                cond_kwargs = {key: getattr(guider_state_batch, key) for key in guider_inputs}
-                guider_state_batch.noise_pred = components.transformer(
-                    hidden_states=latents,
-                    timestep=timestep,
+                batch_size = len(guider_state)
+                cond_kwargs = {
+                    key: torch.cat([getattr(batch, key) for batch in guider_state], dim=0) for key in guider_inputs
+                }
+                # The branches share the latents, hence the stride-0 expand.
+                noise_pred = components.transformer(
+                    hidden_states=latents.expand(batch_size, -1, -1),
+                    timestep=timestep.expand(batch_size),
                     return_dict=False,
                     **cond_kwargs,
                 )[0]
                 components.guider.cleanup_models(components.transformer)
+                for index, guider_state_batch in enumerate(guider_state):
+                    guider_state_batch.noise_pred = noise_pred[index : index + 1]
+            else:
+                for guider_state_batch in guider_state:
+                    components.guider.prepare_models(components.transformer)
+                    cond_kwargs = {key: getattr(guider_state_batch, key) for key in guider_inputs}
+                    guider_state_batch.noise_pred = components.transformer(
+                        hidden_states=latents,
+                        timestep=timestep,
+                        return_dict=False,
+                        **cond_kwargs,
+                    )[0]
+                    components.guider.cleanup_models(components.transformer)
 
             velocity = components.guider(guider_state)[0]
             latents = components.scheduler.step(velocity, t, latents, return_dict=False)[0]
