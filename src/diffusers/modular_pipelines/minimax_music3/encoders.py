@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -341,6 +341,17 @@ class MiniMaxMusic3SemanticGenerationStep(ModularPipelineBlocks):
                     "would otherwise wrap up immediately (e.g. right after a chorus). Capped at `audio_duration`."
                 ),
             ),
+            InputParam(
+                "on_frames_confirmed",
+                default=None,
+                type_hint=Optional[Callable],
+                description=(
+                    "Called as `on_frames_confirmed(frame_hiddens)` each time a batch of frames is settled, with "
+                    "the list of per-frame hidden states generated so far. Those frames are final — the "
+                    "end-of-song rollback can no longer retract any of them — so a caller may render them while "
+                    "the rest of the song is still being sampled. See `minimax_music3.streaming`."
+                ),
+            ),
             InputParam.template("generator"),
         ]
 
@@ -419,6 +430,7 @@ class MiniMaxMusic3SemanticGenerationStep(ModularPipelineBlocks):
         top_k = int(block_state.top_k)
         temperature = float(block_state.temperature)
         min_new_frames = min(int(round(block_state.min_new_seconds * components.frame_rate)), max_frames)
+        on_frames_confirmed = block_state.on_frames_confirmed
 
         language_model = components.language_model
         # Trigger CPU-offload hooks by hand (same workaround as minimax_h3): the autoregressive loop calls
@@ -558,6 +570,11 @@ class MiniMaxMusic3SemanticGenerationStep(ModularPipelineBlocks):
                         ended = True
                         break
                 pending_frames.clear()
+                # `frame_hiddens` is settled here and nowhere else: the rollback above can only ever shorten it
+                # back to a mark taken during this batch, so once the batch is resolved no later frame can
+                # retract one. That makes this the point at which a caller may render what exists so far.
+                if on_frames_confirmed is not None:
+                    on_frames_confirmed(frame_hiddens)
                 if ended or reached_max_frames:
                     break
 
